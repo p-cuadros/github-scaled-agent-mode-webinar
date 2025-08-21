@@ -1,0 +1,45 @@
+name: default
+
+on:
+  pull_request:
+    paths:
+      - '**/*.ts'
+      - '**/*.js'
+      - '**/*.tsx'
+      - '**/*.jsx'
+  push:
+    branches:
+      - main
+    paths:
+      - '**/*.ts'
+      - '**/*.js'
+      - '**/*.tsx'
+      - '**/*.jsx'
+
+queries:
+  - uses: security-extended
+  - uses: security-and-quality
+
+packs:
+  javascript:
+    - codeql/javascript-queries
+    - codeql/javascript-security-extended-queries
+
+disable-default-queries: false
+
+query-filters:
+  - exclude:
+      id: js/hardcoded-credentials
+      
+paths-ignore:
+  - node_modules
+  - dist
+  - build
+  - coverage
+  - '**/*.test.ts'
+  - '**/*.spec.ts'
+
+paths:
+  - src
+  - api/src
+  - frontend/src
