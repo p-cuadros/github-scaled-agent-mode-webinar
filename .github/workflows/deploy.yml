@@ -1,0 +1,194 @@
+name: Deploy
+
+on:
+  pull_request:
+    branches: [ main ]
+    types: [ opened, synchronize, reopened ]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  build-api:
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.vars.outputs.image-tag }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set variables
+      id: vars
+      run: |
+        echo "image-tag=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Build API
+      run: npm run build --workspace=api
+
+    - name: Run API tests
+      run: npm run test:api
+
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        client-id: ${{ env.AZURE_CLIENT_ID }}
+        tenant-id: ${{ env.AZURE_TENANT_ID }}
+        subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Login to Azure Container Registry
+      run: |
+        az acr login --name ${{ vars.AZURE_ACR_NAME }}
+
+    - name: Build and push API Docker image
+      run: |
+        docker build -t ${{ vars.AZURE_ACR_NAME }}.azurecr.io/api:${{ steps.vars.outputs.image-tag }} ./api
+        docker push ${{ vars.AZURE_ACR_NAME }}.azurecr.io/api:${{ steps.vars.outputs.image-tag }}
+
+  build-frontend:
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.vars.outputs.image-tag }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set variables
+      id: vars
+      run: |
+        echo "image-tag=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Build Frontend
+      run: npm run build --workspace=frontend
+
+    - name: Run Frontend linting
+      run: npm run lint
+
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        client-id: ${{ env.AZURE_CLIENT_ID }}
+        tenant-id: ${{ env.AZURE_TENANT_ID }}
+        subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Login to Azure Container Registry
+      run: |
+        az acr login --name ${{ vars.AZURE_ACR_NAME }}
+
+    - name: Build and push Frontend Docker image
+      run: |
+        docker build -t ${{ vars.AZURE_ACR_NAME }}.azurecr.io/frontend:${{ steps.vars.outputs.image-tag }} ./frontend
+        docker push ${{ vars.AZURE_ACR_NAME }}.azurecr.io/frontend:${{ steps.vars.outputs.image-tag }}
+
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: [build-api, build-frontend]
+    environment:
+      name: Staging
+      url: ${{ steps.deploy.outputs.frontendUrl }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        client-id: ${{ env.AZURE_CLIENT_ID }}
+        tenant-id: ${{ env.AZURE_TENANT_ID }}
+        subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Deploy to Staging
+      id: deploy
+      run: |
+        # Replace placeholders in parameter file
+        sed -i "s/\${AZURE_ACR_NAME}/${{ vars.AZURE_ACR_NAME }}/g" infra/parameters/staging.parameters.json
+        sed -i "s/\${IMAGE_TAG}/${{ needs.build-api.outputs.image-tag }}/g" infra/parameters/staging.parameters.json
+        
+        # Deploy infrastructure
+        az deployment group create \
+          --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+          --template-file infra/main.bicep \
+          --parameters @infra/parameters/staging.parameters.json \
+          --query 'properties.outputs' \
+          --output json > deployment-outputs.json
+        
+        # Extract outputs
+        API_URL=$(jq -r '.apiUrl.value' deployment-outputs.json)
+        FRONTEND_URL=$(jq -r '.frontendUrl.value' deployment-outputs.json)
+        
+        echo "apiUrl=$API_URL" >> $GITHUB_OUTPUT
+        echo "frontendUrl=$FRONTEND_URL" >> $GITHUB_OUTPUT
+        
+        echo "✅ Deployment completed successfully"
+        echo "API URL: $API_URL"
+        echo "Frontend URL: $FRONTEND_URL"
+
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [build-api, build-frontend, deploy-staging]
+    environment:
+      name: Production
+      url: ${{ steps.deploy.outputs.frontendUrl }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        client-id: ${{ env.AZURE_CLIENT_ID }}
+        tenant-id: ${{ env.AZURE_TENANT_ID }}
+        subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Deploy to Production
+      id: deploy
+      run: |
+        # Replace placeholders in parameter file
+        sed -i "s/\${AZURE_ACR_NAME}/${{ vars.AZURE_ACR_NAME }}/g" infra/parameters/production.parameters.json
+        sed -i "s/\${IMAGE_TAG}/${{ needs.build-api.outputs.image-tag }}/g" infra/parameters/production.parameters.json
+        
+        # Deploy infrastructure
+        az deployment group create \
+          --resource-group ${{ vars.AZURE_RESOURCE_GROUP_PROD }} \
+          --template-file infra/main.bicep \
+          --parameters @infra/parameters/production.parameters.json \
+          --query 'properties.outputs' \
+          --output json > deployment-outputs.json
+        
+        # Extract outputs
+        API_URL=$(jq -r '.apiUrl.value' deployment-outputs.json)
+        FRONTEND_URL=$(jq -r '.frontendUrl.value' deployment-outputs.json)
+        
+        echo "apiUrl=$API_URL" >> $GITHUB_OUTPUT
+        echo "frontendUrl=$FRONTEND_URL" >> $GITHUB_OUTPUT
+        
+        echo "✅ Production deployment completed successfully"
+        echo "API URL: $API_URL"
+        echo "Frontend URL: $FRONTEND_URL"
